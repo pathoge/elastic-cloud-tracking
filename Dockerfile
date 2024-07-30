@@ -7,4 +7,4 @@ COPY cloud-usage.py .
 
 RUN pip install -r requirements.txt
 
-ENTRYPOINT ["python", "cloud-usage.py", "--debug", "--reset"]
+ENTRYPOINT ["python", "cloud-usage.py", "--debug"]
