@@ -1,0 +1,26 @@
+billing_api_keys:
+  commercial: abcd_1234
+  govcloud: wxzy_5678
+
+output:
+  cloud_id: my-cluster:12345==
+  api_key: abcd1234
+  user: elastic
+  password: qwertyfun
+  index: cloud-consumption
+
+organizations:
+  - id: 1234567890
+    system: govcloud
+    lookback: 7
+    purchases:
+      - date: 2023-09-30
+        ecu: 4000000
+      - date: 2024-06-01
+        ecu: 1234567
+  - id: 0987654321
+    system: commercial
+    lookback: 7
+    purchases:
+      - date: 2024-07-06
+        ecu: 13371337

@@ -7,11 +7,10 @@ import requests
 import sys
 import threading
 import time
-import tomllib
+import yaml
 from datetime import datetime, timedelta
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import streaming_bulk
-
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logging.getLogger("requests").setLevel(logging.WARNING)
@@ -19,25 +18,38 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("elasticsearch").setLevel(logging.WARNING)
 logging.getLogger("elastic_transport").setLevel(logging.WARNING)
 
-semaphore = threading.Semaphore(30)
+semaphore = threading.Semaphore(16)
 
 
-def setup_es(cloud_id, user, pw, index, reset):
-    # create connection to elasticsearch for output
-    es = Elasticsearch(cloud_id=cloud_id, basic_auth=(user, pw))
-    ping = es.ping()
-    if ping:
-        logging.debug("Connection to ES output succeeded")
-    else:
-        logging.fatal("Failed to connect to ES output! Check cloud ID and creds")
-        sys.exit()
+def connect_es(config: dict, reset) -> Elasticsearch:
+    if "api_key" in config:
+        try:
+            client = Elasticsearch(
+                cloud_id=config["cloud_id"], api_key=config["api_key"]
+            )
+            # Test the connection
+            client.info()
+        except Exception:
+            pass
+    if "user" in config and "password" in config:
+        try:
+            client = Elasticsearch(
+                cloud_id=config["cloud_id"],
+                basic_auth=(config["user"], config["password"]),
+            )
+            # Test the connection
+            client.info()
+        except Exception:
+            raise Exception(
+                "Failed to connect to Elasticsearch with provided credentials."
+            )
 
-    if reset and es.indices.exists(index=index):
-        logging.info("Deleting index " + index)
-        es.indices.delete(index=index)
+    if reset and client.indices.exists(index=config["index"]):
+        logging.info("Deleting index " + config["index"])
+        client.indices.delete(index=config["index"])
 
-    if not es.indices.exists(index=index):
-        logging.debug(f"Creating index {index}")
+    if not client.indices.exists(index=config["index"]):
+        logging.debug(f"Creating index {config["index"]}")
         mapping = {
             "properties": {
                 "@timestamp": {"type": "date"},
@@ -47,16 +59,16 @@ def setup_es(cloud_id, user, pw, index, reset):
                 "deployment.name": {"type": "keyword"},
             }
         }
-        es.indices.create(index=index, mappings=mapping)
-    return es
+        client.indices.create(index=config["index"], mappings=mapping)
+    return client
 
 
 def read_config(config_path):
     logging.debug(f"Reading {config_path}")
-    with open(config_path, "rb") as f:
-        config_data = tomllib.load(f)
+    with open(config_path) as f:
+        cfg = yaml.load(f, Loader=yaml.FullLoader)
 
-    return config_data
+    return cfg
 
 
 def lookback(n):
@@ -69,7 +81,7 @@ def lookback(n):
     return dates
 
 
-def flatten_dat(data):
+def flatten(data):
     # start with costs
     dimensions = data["costs"].pop("dimensions")
     for dimension in dimensions:
@@ -82,7 +94,7 @@ def flatten_dat(data):
         item_key = item.pop("type")
         data["dts"][item_key] = item
 
-    # do resources? more complicated
+    # do resources? more complicated (TODO)
     return data
 
 
@@ -116,12 +128,12 @@ def do_work(day, org_id, org_name, headers, results):
                 )
                 if res.status_code == 200:
                     data = res.json()
-                    doc["deployment.items"] = flatten_dat(data)
+                    doc["deployment.items"] = flatten(data)
                 results.append(doc)
             return
         else:
             tries += 1
-            wait = 3
+            wait = 5
             logging.debug(
                 f"API call attempt {tries} failed with status code {res.status_code}. Retrying in {wait} secs..."
             )
@@ -139,7 +151,7 @@ def get_org_name(base_url, headers, org_id):
         res = requests.get(f"{base_url}/organizations/{org_id}", headers=headers)
         data = json.loads(res.text)
     except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to reach API when looking up org {org_id}")
+        logging.error(f"Failed to reach API when looking up org {org_id}: {e}")
     if res.status_code == 200:
         return data["name"]
     else:
@@ -171,25 +183,20 @@ def add_credits(org_id, day, ecus, es, index):
     )
 
 
-def add_overage(org_id, day, ecus, es, index):
-    doc = {}
-    doc["@timestamp"] = day
-    doc["organization.id"] = str(org_id)
-    doc["organization.overage"] = ecus
-    es.index(
-        index=index,
-        document=doc,
-        id=create_uuid_from_string(day + str(org_id) + "overage"),
-    )
-
-
 def delete_and_add_forecast(org_id, base_url, headers):
-    query_body = {"query": {"term": {"organization.forecast": {"value": "true"}}}}
-    delete_resp = es.delete_by_query(
-        index=config_data["output"]["index"], body=query_body
-    )
+    query_body = {
+        "query": {
+            "bool": {
+                "must": [
+                    {"term": {"organization.id": {"value": org_id}}},
+                    {"term": {"organization.forecast": {"value": "true"}}},
+                ]
+            }
+        }
+    }
+    delete_resp = es.delete_by_query(index=cfg["output"]["index"], body=query_body)
     logging.debug(
-        f'Deleted {delete_resp["deleted"]} forecast docs. Recalculating forecast now'
+        f'Deleted {delete_resp["deleted"]} forecast docs. (Re)calculating forecast now'
     )
     look_back = 7
     look_forward = 91
@@ -216,7 +223,7 @@ def delete_and_add_forecast(org_id, base_url, headers):
         docs.append(doc)
 
     logging.debug(f"Ingesting forecast for {org_id} from {start} to {end}")
-    bulk_ingest(es, config_data["output"]["index"], docs)
+    bulk_ingest(es, cfg["output"]["index"], docs)
 
 
 if __name__ == "__main__":
@@ -224,7 +231,7 @@ if __name__ == "__main__":
         description="Fetch Elastic cloud billing & usage data"
     )
     parser.add_argument(
-        "-c", "--config", action="store", dest="config_path", default="config.toml"
+        "-c", "--config", action="store", dest="config_path", default="config.yml"
     )
     parser.add_argument("-d", "--debug", action="store_true", default=False)
     parser.add_argument("-r", "--reset", action="store_true", default=False)
@@ -233,32 +240,29 @@ if __name__ == "__main__":
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    config_data = read_config(args.config_path)
-    api_keys = config_data["api_keys"]
+    cfg = read_config(args.config_path)
+    api_keys = cfg["billing_api_keys"]
 
     results = []
 
-    es = setup_es(
-        config_data["output"]["cloud_id"],
-        config_data["output"]["user"],
-        config_data["output"]["pw"],
-        config_data["output"]["index"],
+    es = connect_es(
+        cfg["output"],
         args.reset,
     )
 
-    for customer in config_data["customer"]:
-        org_id = customer["org_id"]
+    for org in cfg["organizations"]:
+        org_id = org["id"]
         logging.info(f"Processing {org_id}")
 
-        if customer["system"] == "govcloud":
+        if org["system"] == "govcloud":
             base_url = "https://admin.us-gov-east-1.aws.elastic-cloud.com/api/v1"
             api_key = api_keys["govcloud"]
-        elif customer["system"] == "commercial":
+        elif org["system"] == "commercial":
             base_url = "https://adminconsole.found.no/api/v1"
             api_key = api_keys["commercial"]
         else:
             logging.fatal(
-                "Need to specify either govcloud or commercial for system in config"
+                "You must specify either govcloud or commercial for system in organization config"
             )
             sys.exit()
 
@@ -268,20 +272,20 @@ if __name__ == "__main__":
         }
 
         org_name = get_org_name(base_url, headers, org_id)
-        logging.debug(
-            f"Found {org_id} in {customer['system']} with org name: {org_name}"
-        )
+        if not org_name:
+            continue
+        logging.debug(f"Found {org_id} in {org['system']} with name: {org_name}")
 
         today = datetime.now().strftime("%Y-%m-%d")
 
-        if customer["lookback"] >= 60:
+        if org["lookback"] >= 60:
             logging.warning(
-                f"Lookback of {customer['lookback']} is high, APIs may reject due to too many requests"
+                f"Lookback of {org['lookback']} is high, APIs may reject due to too many requests. If you encounter errors, try re-running the script."
             )
 
         logging.debug("Spinning threads to pull data from APIs")
         threads = []
-        for day in lookback(customer["lookback"]):
+        for day in lookback(org["lookback"]):
             t = threading.Thread(
                 target=worker_thread, args=(day, org_id, org_name, headers, results)
             )
@@ -291,27 +295,18 @@ if __name__ == "__main__":
         for t in threads:
             t.join()
 
-        bulk_ingest(es, config_data["output"]["index"], results)
+        bulk_ingest(es, cfg["output"]["index"], results)
 
-        logging.info("Adding purchases")
-        for purchase in customer["purchase"]:
-            add_credits(
-                org_id,
-                purchase["date"].strftime("%Y-%m-%d"),
-                purchase["ecu"],
-                es,
-                config_data["output"]["index"],
-            )
-
-        logging.info("Adding overage charges")
-        for overage in customer["overage"]:
-            add_overage(
-                org_id,
-                overage["date"].strftime("%Y-%m-%d"),
-                overage["ecu"],
-                es,
-                config_data["output"]["index"],
-            )
+        if "purchases" in org:
+            logging.info("Adding ECU purchase info")
+            for purchase in org["purchases"]:
+                add_credits(
+                    org_id,
+                    purchase["date"].strftime("%Y-%m-%d"),
+                    purchase["ecu"],
+                    es,
+                    cfg["output"]["index"],
+                )
 
         logging.info("Calculating consumption forecast")
         delete_and_add_forecast(org_id, base_url, headers)
