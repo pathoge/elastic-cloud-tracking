@@ -22,6 +22,7 @@ semaphore = threading.Semaphore(8)
 
 
 def connect_es(config: dict, reset) -> Elasticsearch:
+    connected = False
     if "api_key" in config:
         try:
             client = Elasticsearch(
@@ -29,9 +30,10 @@ def connect_es(config: dict, reset) -> Elasticsearch:
             )
             # Test the connection
             client.info()
+            connected = True
         except Exception:
             pass
-    elif "user" in config and "password" in config:
+    if not connected and "user" in config and "password" in config:
         try:
             client = Elasticsearch(
                 cloud_id=config["cloud_id"],
