@@ -18,7 +18,7 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("elasticsearch").setLevel(logging.WARNING)
 logging.getLogger("elastic_transport").setLevel(logging.WARNING)
 
-semaphore = threading.Semaphore(16)
+semaphore = threading.Semaphore(8)
 
 
 def connect_es(config: dict, reset) -> Elasticsearch:
@@ -31,7 +31,7 @@ def connect_es(config: dict, reset) -> Elasticsearch:
             client.info()
         except Exception:
             pass
-    if "user" in config and "password" in config:
+    elif "user" in config and "password" in config:
         try:
             client = Elasticsearch(
                 cloud_id=config["cloud_id"],
@@ -171,10 +171,11 @@ def yield_doc(docs):
         yield doc
 
 
-def add_credits(org_id, day, ecus, es, index):
+def add_credits(org_id, org_name, day, ecus, es, index):
     doc = {}
     doc["@timestamp"] = day
     doc["organization.id"] = str(org_id)
+    doc["organization.name"] = org_name
     doc["organization.credits"] = ecus
     es.index(
         index=index,
@@ -183,7 +184,7 @@ def add_credits(org_id, day, ecus, es, index):
     )
 
 
-def delete_and_add_forecast(org_id, base_url, headers):
+def delete_and_add_forecast(org_id, org_name, base_url, headers):
     query_body = {
         "query": {
             "bool": {
@@ -218,6 +219,7 @@ def delete_and_add_forecast(org_id, base_url, headers):
         doc["@timestamp"] = ts
         doc["_id"] = create_uuid_from_string(ts + str(org_id) + "forecast")
         doc["organization.id"] = str(org_id)
+        doc["organization.name"] = org_name
         doc["organization.forecast"] = True
         doc["organization.forecast_credits"] = daily
         docs.append(doc)
@@ -302,6 +304,7 @@ if __name__ == "__main__":
             for purchase in org["purchases"]:
                 add_credits(
                     org_id,
+                    org_name,
                     purchase["date"].strftime("%Y-%m-%d"),
                     purchase["ecu"],
                     es,
