@@ -314,4 +314,4 @@ if __name__ == "__main__":
                 )
 
         logging.info("Calculating consumption forecast")
-        delete_and_add_forecast(org_id, base_url, headers)
+        delete_and_add_forecast(org_id, org_name, base_url, headers)
