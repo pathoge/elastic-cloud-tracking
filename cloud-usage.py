@@ -18,40 +18,60 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("elasticsearch").setLevel(logging.WARNING)
 logging.getLogger("elastic_transport").setLevel(logging.WARNING)
 
-semaphore = threading.Semaphore(8)
+semaphore = threading.Semaphore(2)
 
 
 def connect_es(config: dict, reset) -> Elasticsearch:
     connected = False
+    client: Elasticsearch | None = None
+
+    # Determine connection parameters based on cloud_id or endpoint
+    if "cloud_id" in config:
+        # Use Elastic Cloud connection
+        es_params = {"cloud_id": config["cloud_id"]}
+    elif "endpoint" in config:
+        # Use direct Elasticsearch endpoint
+        es_params = {"hosts": config["endpoint"]}
+    else:
+        raise Exception(
+            "Either 'cloud_id' or 'endpoint' must be specified in the output config."
+        )
+
+    # Try API key authentication first
     if "api_key" in config:
         try:
-            client = Elasticsearch(
-                cloud_id=config["cloud_id"], api_key=config["api_key"]
-            )
+            client = Elasticsearch(api_key=config["api_key"], **es_params)
             # Test the connection
             client.info()
             connected = True
         except Exception:
             pass
+
+    # Fall back to basic auth if API key didn't work or wasn't provided
     if not connected and "user" in config and "password" in config:
         try:
             client = Elasticsearch(
-                cloud_id=config["cloud_id"],
-                basic_auth=(config["user"], config["password"]),
+                basic_auth=(config["user"], config["password"]), **es_params
             )
             # Test the connection
             client.info()
+            connected = True
         except Exception:
             raise Exception(
                 "Failed to connect to Elasticsearch with provided credentials."
             )
+
+    if not connected or client is None:
+        raise Exception(
+            "Failed to connect to Elasticsearch. Please provide either 'api_key' or both 'user' and 'password' in the output config."
+        )
 
     if reset and client.indices.exists(index=config["index"]):
         logging.info("Deleting index " + config["index"])
         client.indices.delete(index=config["index"])
 
     if not client.indices.exists(index=config["index"]):
-        logging.debug(f"Creating index {config["index"]}")
+        logging.debug(f"Creating index {config['index']}")
         mapping = {
             "properties": {
                 "@timestamp": {"type": "date"},
@@ -106,38 +126,103 @@ def worker_thread(day, org_id, org_name, headers, results):
 
 
 def do_work(day, org_id, org_name, headers, results):
-    ok = False
-    tries = 0
-    while not ok:
+    org_get_ok = False
+    org_get_tries = 0
+    wait = 10
+    while not org_get_ok:
         res = requests.get(
             f"{base_url}/billing/costs/{org_id}/charts?from={day}&to={day}",
             headers=headers,
         )
         if res.status_code == 200:
-            ok = True
+            org_get_ok = True
             data = res.json()
             for deployment in data["data"][0]["values"]:
+                logging.debug(
+                    f"Fetching single day deployment usage for {org_name}/{org_id}/{deployment['name']}/{deployment['id']} for {day}"
+                )
                 doc = {}
                 doc["@timestamp"] = day
-                doc["_id"] = create_uuid_from_string(day + deployment["id"])
+                doc["_id"] = create_uuid_from_string(day + str(deployment["id"]))
                 doc["organization.id"] = org_id
                 doc["organization.name"] = org_name
                 doc["deployment.id"] = deployment["id"]
                 doc["deployment.name"] = deployment["name"]
-                res = requests.get(
-                    f"{base_url}/billing/costs/{org_id}/deployments/{deployment['id']}/items?from={day}&to={day}",
-                    headers=headers,
-                )
-                if res.status_code == 200:
-                    data = res.json()
-                    doc["deployment.items"] = flatten(data)
-                results.append(doc)
-            return
+                dep_get_ok = False
+                dep_get_tries = 0
+                while not dep_get_ok:
+                    res = requests.get(
+                        f"{base_url}/billing/costs/{org_id}/deployments/{deployment['id']}/items?from={day}&to={day}",
+                        headers=headers,
+                    )
+                    if res.status_code == 200:
+                        dep_get_ok = True
+                        data = res.json()
+                        doc["deployment.items"] = flatten(data)
+                        results.append(doc)
+                        break  # Exit while loop to move to next deployment
+                    elif res.status_code == 404:
+                        # Check if it's a resource_not_found error
+                        try:
+                            error_data = res.json()
+                            if "errors" in error_data and len(error_data["errors"]) > 0:
+                                error_code = error_data["errors"][0].get("code", "")
+                                if error_code == "root.resource_not_found":
+                                    dep_get_ok = (
+                                        True  # Mark as handled to exit retry loop
+                                    )
+                                    break  # Exit while loop to move to next deployment
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            # If we can't parse the error, fall through to retry logic
+                            pass
+
+                    # For non-404 errors or unparseable 404s, retry
+                    if not dep_get_ok:
+                        dep_get_tries += 1
+                        # Parse error message for cleaner logging
+                        error_msg = ""
+                        try:
+                            error_data = res.json()
+                            if "errors" in error_data and len(error_data["errors"]) > 0:
+                                error_code = error_data["errors"][0].get("code", "")
+                                error_message = error_data["errors"][0].get(
+                                    "message", ""
+                                )
+                                if res.status_code == 429:
+                                    error_msg = f"Rate limited ({error_code})"
+                                else:
+                                    error_msg = f"{error_code}: {error_message}"
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            error_msg = (
+                                res.text[:100]
+                                if len(res.text) <= 100
+                                else res.text[:100] + "..."
+                            )
+
+                        logging.debug(
+                            f"Deployment get API call attempt {dep_get_tries} failed with status code {res.status_code} - {error_msg}. Retrying in {wait} secs..."
+                        )
+                        time.sleep(wait)
         else:
-            tries += 1
-            wait = 5
+            org_get_tries += 1
+            # Parse error message for cleaner logging
+            error_msg = ""
+            try:
+                error_data = res.json()
+                if "errors" in error_data and len(error_data["errors"]) > 0:
+                    error_code = error_data["errors"][0].get("code", "")
+                    error_message = error_data["errors"][0].get("message", "")
+                    if res.status_code == 429:
+                        error_msg = f"Rate limited ({error_code})"
+                    else:
+                        error_msg = f"{error_code}: {error_message}"
+            except (json.JSONDecodeError, KeyError, IndexError):
+                error_msg = (
+                    res.text[:100] if len(res.text) <= 100 else res.text[:100] + "..."
+                )
+
             logging.debug(
-                f"API call attempt {tries} failed with status code {res.status_code}. Retrying in {wait} secs..."
+                f"Org get API call attempt {org_get_tries} failed with status code {res.status_code} - {error_msg}. Retrying in {wait} secs..."
             )
             time.sleep(wait)
 
@@ -151,13 +236,14 @@ def get_org_name(base_url, headers, org_id):
     # get org base info (just the name for now)
     try:
         res = requests.get(f"{base_url}/organizations/{org_id}", headers=headers)
-        data = json.loads(res.text)
+        if res.status_code == 200:
+            data = json.loads(res.text)
+            return data["name"]
+        else:
+            logging.debug(f"Org {org_id} not found in {base_url}")
+            return False
     except requests.exceptions.RequestException as e:
         logging.error(f"Failed to reach API when looking up org {org_id}: {e}")
-    if res.status_code == 200:
-        return data["name"]
-    else:
-        logging.debug(f"Org {org_id} not found in {base_url}")
         return False
 
 
@@ -199,7 +285,7 @@ def delete_and_add_forecast(org_id, org_name, base_url, headers):
     }
     delete_resp = es.delete_by_query(index=cfg["output"]["index"], body=query_body)
     logging.debug(
-        f'Deleted {delete_resp["deleted"]} forecast docs. (Re)calculating forecast now'
+        f"Deleted {delete_resp['deleted']} forecast docs. (Re)calculating forecast now"
     )
     look_back = 7
     look_forward = 91
