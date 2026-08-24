@@ -15,6 +15,8 @@ organizations:
   - id: 1234567890
     system: govcloud
     lookback: 7
+    name_internal: Team Foobar Gov
+    parent_name: foobar
     purchases:
       - date: 2023-09-30
         ecu: 4000000
@@ -23,6 +25,8 @@ organizations:
   - id: 0987654321
     system: commercial
     lookback: 7
+    name_internal: Team Barbaz Commercial
+    parent_name: barbaz
     purchases:
       - date: 2024-07-06
         ecu: 13371337

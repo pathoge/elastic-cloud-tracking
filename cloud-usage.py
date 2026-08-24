@@ -18,7 +18,7 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("elasticsearch").setLevel(logging.WARNING)
 logging.getLogger("elastic_transport").setLevel(logging.WARNING)
 
-semaphore = threading.Semaphore(2)
+semaphore = threading.Semaphore(8)
 
 
 def connect_es(config: dict, reset) -> Elasticsearch:
@@ -73,12 +73,113 @@ def connect_es(config: dict, reset) -> Elasticsearch:
     if not client.indices.exists(index=config["index"]):
         logging.debug(f"Creating index {config['index']}")
         mapping = {
+            "dynamic_templates": [
+                {
+                    "resources_by_kind_instance_count": {
+                        "path_match": "deployment.items.resources.by_kind.*.instance_count",
+                        "mapping": {"type": "long"},
+                    }
+                },
+                {
+                    "resources_by_kind_instance_hours": {
+                        "path_match": "deployment.items.resources.by_kind.*.instance_hours",
+                        "mapping": {"type": "long"},
+                    }
+                },
+                {
+                    "resources_by_kind_hours": {
+                        "path_match": "deployment.items.resources.by_kind.*.hours",
+                        "mapping": {"type": "long"},
+                    }
+                },
+                {
+                    "resources_by_kind_resource_count": {
+                        "path_match": "deployment.items.resources.by_kind.*.resource_count",
+                        "mapping": {"type": "long"},
+                    }
+                },
+                {
+                    "resources_by_kind_avg_instance_count": {
+                        "path_match": "deployment.items.resources.by_kind.*.avg_instance_count",
+                        "mapping": {"type": "double"},
+                    }
+                },
+                {
+                    "resources_by_kind_price": {
+                        "path_match": "deployment.items.resources.by_kind.*.price",
+                        "mapping": {"type": "double"},
+                    }
+                },
+                {
+                    "resources_by_kind_price_per_hour": {
+                        "path_match": "deployment.items.resources.by_kind.*.price_per_hour",
+                        "mapping": {"type": "double"},
+                    }
+                },
+                {
+                    "resources_by_es_tier_instance_count": {
+                        "path_match": "deployment.items.resources.by_es_tier.*.instance_count",
+                        "mapping": {"type": "long"},
+                    }
+                },
+                {
+                    "resources_by_es_tier_instance_hours": {
+                        "path_match": "deployment.items.resources.by_es_tier.*.instance_hours",
+                        "mapping": {"type": "long"},
+                    }
+                },
+                {
+                    "resources_by_es_tier_hours": {
+                        "path_match": "deployment.items.resources.by_es_tier.*.hours",
+                        "mapping": {"type": "long"},
+                    }
+                },
+                {
+                    "resources_by_es_tier_resource_count": {
+                        "path_match": "deployment.items.resources.by_es_tier.*.resource_count",
+                        "mapping": {"type": "long"},
+                    }
+                },
+                {
+                    "resources_by_es_tier_avg_instance_count": {
+                        "path_match": "deployment.items.resources.by_es_tier.*.avg_instance_count",
+                        "mapping": {"type": "double"},
+                    }
+                },
+                {
+                    "resources_by_es_tier_price": {
+                        "path_match": "deployment.items.resources.by_es_tier.*.price",
+                        "mapping": {"type": "double"},
+                    }
+                },
+                {
+                    "resources_by_es_tier_price_per_hour": {
+                        "path_match": "deployment.items.resources.by_es_tier.*.price_per_hour",
+                        "mapping": {"type": "double"},
+                    }
+                },
+            ],
             "properties": {
                 "@timestamp": {"type": "date"},
                 "organization.id": {"type": "keyword"},
                 "organization.name": {"type": "keyword"},
+                "organization.name_internal": {"type": "keyword"},
+                "organization.parent_name": {"type": "keyword"},
+                "organization.credits": {"type": "double"},
+                "organization.forecast": {"type": "boolean"},
+                "organization.forecast_credits": {"type": "double"},
                 "deployment.id": {"type": "keyword"},
                 "deployment.name": {"type": "keyword"},
+                "deployment.items.resources.totals.instance_count": {"type": "long"},
+                "deployment.items.resources.totals.instance_hours": {"type": "long"},
+                "deployment.items.resources.totals.avg_instance_count": {
+                    "type": "double"
+                },
+                "deployment.items.resources.totals.hours": {"type": "long"},
+                "deployment.items.resources.totals.price": {"type": "double"},
+                "deployment.items.resources.totals.price_per_hour": {"type": "double"},
+                "deployment.items.resources.totals.resource_count": {"type": "long"},
+                "deployment.items.resources.totals.day_hours": {"type": "long"},
             }
         }
         client.indices.create(index=config["index"], mappings=mapping)
@@ -103,6 +204,32 @@ def lookback(n):
     return dates
 
 
+def get_es_tier(resource):
+    sku = (resource.get("sku", "") or "").lower()
+    name = (resource.get("name", "") or "").lower()
+    identifiers = f"{sku} {name}"
+
+    if "datahot" in identifiers:
+        return "hot"
+    if "datawarm" in identifiers:
+        return "warm"
+    if "datacold" in identifiers:
+        return "cold"
+    if "datafrozen" in identifiers:
+        return "frozen"
+    if ".master." in identifiers or " master " in identifiers:
+        return "master"
+    if ".ml." in identifiers or " ml " in identifiers:
+        return "ml"
+    if "coordinating" in identifiers:
+        return "coordinating"
+    if "ingest" in identifiers:
+        return "ingest"
+    if "datacontent" in identifiers or "data_content" in identifiers:
+        return "content"
+    return "other"
+
+
 def flatten(data):
     # start with costs
     dimensions = data["costs"].pop("dimensions")
@@ -116,16 +243,101 @@ def flatten(data):
         item_key = item.pop("type")
         data["dts"][item_key] = item
 
-    # do resources? more complicated (TODO)
+    # flatten resources into numeric summary fields for easier aggregations
+    resources = data.pop("resources", [])
+    data["resources"] = {
+        "totals": {
+            "instance_count": 0,
+            "instance_hours": 0,
+            "avg_instance_count": 0.0,
+            "hours": 0,
+            "price": 0.0,
+            "price_per_hour": 0.0,
+            "resource_count": 0,
+            "day_hours": 0,
+        },
+        "by_kind": {},
+        "by_es_tier": {},
+    }
+    day_hours = 0
+
+    for resource in resources:
+        kind = resource.get("kind", "unknown")
+        instance_count = resource.get("instance_count", 0) or 0
+        hours = resource.get("hours", 0) or 0
+        price = resource.get("price", 0.0) or 0.0
+        price_per_hour = resource.get("price_per_hour", 0.0) or 0.0
+
+        if hours > day_hours:
+            day_hours = hours
+
+        kind_bucket = data["resources"]["by_kind"].setdefault(
+            kind,
+            {
+                "instance_count": 0,
+                "instance_hours": 0,
+                "avg_instance_count": 0.0,
+                "hours": 0,
+                "price": 0.0,
+                "price_per_hour": 0.0,
+                "resource_count": 0,
+            },
+        )
+
+        kind_bucket["instance_count"] += instance_count
+        kind_bucket["instance_hours"] += instance_count * hours
+        kind_bucket["hours"] += hours
+        kind_bucket["price"] += price
+        kind_bucket["price_per_hour"] += price_per_hour
+        kind_bucket["resource_count"] += 1
+
+        data["resources"]["totals"]["instance_count"] += instance_count
+        data["resources"]["totals"]["instance_hours"] += instance_count * hours
+        data["resources"]["totals"]["hours"] += hours
+        data["resources"]["totals"]["price"] += price
+        data["resources"]["totals"]["price_per_hour"] += price_per_hour
+        data["resources"]["totals"]["resource_count"] += 1
+
+        if kind == "elasticsearch":
+            es_tier = get_es_tier(resource)
+            tier_bucket = data["resources"]["by_es_tier"].setdefault(
+                es_tier,
+                {
+                    "instance_count": 0,
+                    "instance_hours": 0,
+                    "avg_instance_count": 0.0,
+                    "hours": 0,
+                    "price": 0.0,
+                    "price_per_hour": 0.0,
+                    "resource_count": 0,
+                },
+            )
+            tier_bucket["instance_count"] += instance_count
+            tier_bucket["instance_hours"] += instance_count * hours
+            tier_bucket["hours"] += hours
+            tier_bucket["price"] += price
+            tier_bucket["price_per_hour"] += price_per_hour
+            tier_bucket["resource_count"] += 1
+
+    if day_hours > 0:
+        data["resources"]["totals"]["day_hours"] = day_hours
+        data["resources"]["totals"]["avg_instance_count"] = (
+            data["resources"]["totals"]["instance_hours"] / day_hours
+        )
+        for kind_bucket in data["resources"]["by_kind"].values():
+            kind_bucket["avg_instance_count"] = kind_bucket["instance_hours"] / day_hours
+        for tier_bucket in data["resources"]["by_es_tier"].values():
+            tier_bucket["avg_instance_count"] = tier_bucket["instance_hours"] / day_hours
+
     return data
 
 
-def worker_thread(day, org_id, org_name, headers, results):
+def worker_thread(day, org_id, org_name, org_name_internal, parent_name, headers, results):
     with semaphore:
-        do_work(day, org_id, org_name, headers, results)
+        do_work(day, org_id, org_name, org_name_internal, parent_name, headers, results)
 
 
-def do_work(day, org_id, org_name, headers, results):
+def do_work(day, org_id, org_name, org_name_internal, parent_name, headers, results):
     org_get_ok = False
     org_get_tries = 0
     wait = 10
@@ -146,6 +358,10 @@ def do_work(day, org_id, org_name, headers, results):
                 doc["_id"] = create_uuid_from_string(day + str(deployment["id"]))
                 doc["organization.id"] = org_id
                 doc["organization.name"] = org_name
+                if org_name_internal:
+                    doc["organization.name_internal"] = org_name_internal
+                if parent_name:
+                    doc["organization.parent_name"] = parent_name
                 doc["deployment.id"] = deployment["id"]
                 doc["deployment.name"] = deployment["name"]
                 dep_get_ok = False
@@ -259,11 +475,15 @@ def yield_doc(docs):
         yield doc
 
 
-def add_credits(org_id, org_name, day, ecus, es, index):
+def add_credits(org_id, org_name, org_name_internal, parent_name, day, ecus, es, index):
     doc = {}
     doc["@timestamp"] = day
     doc["organization.id"] = str(org_id)
     doc["organization.name"] = org_name
+    if org_name_internal:
+        doc["organization.name_internal"] = org_name_internal
+    if parent_name:
+        doc["organization.parent_name"] = parent_name
     doc["organization.credits"] = ecus
     es.index(
         index=index,
@@ -272,7 +492,9 @@ def add_credits(org_id, org_name, day, ecus, es, index):
     )
 
 
-def delete_and_add_forecast(org_id, org_name, base_url, headers):
+def delete_and_add_forecast(
+    org_id, org_name, org_name_internal, parent_name, base_url, headers
+):
     query_body = {
         "query": {
             "bool": {
@@ -300,19 +522,32 @@ def delete_and_add_forecast(org_id, org_name, base_url, headers):
     total = float(json.loads(res.text)["costs"]["total"])
     daily = float(total) / look_back
     docs = []
-    td = datetime.today()
-    for x in range(1, look_forward):
+    today = datetime.now().date()
+    ninety_first_day = today + timedelta(days=look_forward)
+    first_day_next_month = (ninety_first_day.replace(day=1) + timedelta(days=32)).replace(
+        day=1
+    )
+    forecast_end_date = first_day_next_month - timedelta(days=1)
+    forecast_days = (forecast_end_date - today).days
+
+    for x in range(1, forecast_days + 1):
         doc = {}
-        ts = str((td + timedelta(days=x)).strftime("%Y-%m-%d"))
+        ts = str((today + timedelta(days=x)).strftime("%Y-%m-%d"))
         doc["@timestamp"] = ts
         doc["_id"] = create_uuid_from_string(ts + str(org_id) + "forecast")
         doc["organization.id"] = str(org_id)
         doc["organization.name"] = org_name
+        if org_name_internal:
+            doc["organization.name_internal"] = org_name_internal
+        if parent_name:
+            doc["organization.parent_name"] = parent_name
         doc["organization.forecast"] = True
         doc["organization.forecast_credits"] = daily
         docs.append(doc)
 
-    logging.debug(f"Ingesting forecast for {org_id} from {start} to {end}")
+    logging.debug(
+        f"Ingesting forecast for {org_id} through {forecast_end_date} ({forecast_days} days)"
+    )
     bulk_ingest(es, cfg["output"]["index"], docs)
 
 
@@ -342,7 +577,10 @@ if __name__ == "__main__":
 
     for org in cfg["organizations"]:
         org_id = org["id"]
-        logging.info(f"Processing {org_id}")
+        org_name_internal = org.get("name_internal")
+        parent_name = org.get("parent_name")
+        display_name = org_name_internal if org_name_internal else org_id
+        logging.info(f"Processing {display_name}")
 
         if org["system"] == "govcloud":
             base_url = "https://admin.us-gov-east-1.aws.elastic-cloud.com/api/v1"
@@ -377,7 +615,16 @@ if __name__ == "__main__":
         threads = []
         for day in lookback(org["lookback"]):
             t = threading.Thread(
-                target=worker_thread, args=(day, org_id, org_name, headers, results)
+                target=worker_thread,
+                args=(
+                    day,
+                    org_id,
+                    org_name,
+                    org_name_internal,
+                    parent_name,
+                    headers,
+                    results,
+                ),
             )
             threads.append(t)
             t.start()
@@ -393,6 +640,8 @@ if __name__ == "__main__":
                 add_credits(
                     org_id,
                     org_name,
+                    org_name_internal,
+                    parent_name,
                     purchase["date"].strftime("%Y-%m-%d"),
                     purchase["ecu"],
                     es,
@@ -400,4 +649,6 @@ if __name__ == "__main__":
                 )
 
         logging.info("Calculating consumption forecast")
-        delete_and_add_forecast(org_id, org_name, base_url, headers)
+        delete_and_add_forecast(
+            org_id, org_name, org_name_internal, parent_name, base_url, headers
+        )
